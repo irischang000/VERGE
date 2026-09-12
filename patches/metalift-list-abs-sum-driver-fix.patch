@@ -1,0 +1,35 @@
+diff --git a/tests/llvm/list_abs_sum_driver.py b/tests/llvm/list_abs_sum_driver.py
+index 1ad3c52b..fd284046 100644
+--- a/tests/llvm/list_abs_sum_driver.py
++++ b/tests/llvm/list_abs_sum_driver.py
+@@ -1,4 +1,3 @@
+-from collections import defaultdict
+ from typing import List
+ 
+ from metalift.frontend.llvm import Driver, InvGrammar
+@@ -6,7 +5,6 @@ from metalift.ir import Bool, Expr, FnDeclRecursive, Int
+ from metalift.ir import List as mlList
+ from metalift.ir import Object, call, choose, fn_decl_recursive, ite
+ from metalift.vc_util import and_objects
+-from tests.python.utils.utils import codegen
+ 
+ # We use test_abs instead of abs because abs is reserved in cvc5.
+ TEST_ABS_FN_NAME = "test_abs"
+@@ -72,7 +70,7 @@ if __name__ == "__main__":
+         loops_filepath="tests/llvm/list_abs_sum.loops",
+         fn_name="test",
+         target_lang_fn=target_lang,
+-        inv_grammars=defaultdict(lambda: InvGrammar(inv_grammar, [])),
++        inv_grammars={"test_inv0": InvGrammar(inv_grammar, [])},
+         ps_grammar=ps_grammar,
+     )
+ 
+@@ -82,8 +80,3 @@ if __name__ == "__main__":
+     test(lst)
+ 
+     driver.synthesize(filename="list_abs_sum")
+-
+-    print("====== summary in target language")
+-
+-    fn_def = process_candidate_func(candidates[1])
+-    print(code_gen(fn_def))

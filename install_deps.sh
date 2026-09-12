@@ -321,6 +321,25 @@ fi
 
 export BITWUZLA_PATH="${BITWUZLA_BIN}"
 
+# Rosette's own `bitwuzla` binding ignores BITWUZLA_PATH entirely -- it only
+# looks for the binary inside its own package directory
+# (<pkgs>/rosette/bin/bitwuzla), and fails instantly if it's not there. When
+# that happens, metalift's Python wrapper (which pipes racket's stdout/stderr)
+# doesn't surface the crash -- it just retries silently forever, looking
+# exactly like a hang. Symlink it into place so Rosette actually finds it.
+if [[ "${SKIP_RACKET}" -ne 1 && "${SKIP_BITWUZLA}" -ne 1 && -x "${RACKET_PREFIX}/bin/racket" && -x "${BITWUZLA_BIN}" ]]; then
+  ROSETTE_COLLECTION_FILE="$("${RACKET_PREFIX}/bin/racket" -e '(displayln (path->string (collection-file-path "rosette" "rosette")))' 2>/dev/null || true)"
+  if [[ -n "${ROSETTE_COLLECTION_FILE}" ]]; then
+    ROSETTE_PKG_DIR="$(dirname "$(dirname "${ROSETTE_COLLECTION_FILE}")")"
+    ROSETTE_BIN_DIR="${ROSETTE_PKG_DIR}/bin"
+    mkdir -p "${ROSETTE_BIN_DIR}"
+    ln -sf "${BITWUZLA_BIN}" "${ROSETTE_BIN_DIR}/bitwuzla"
+    ok "Linked bitwuzla into Rosette's package dir: ${ROSETTE_BIN_DIR}/bitwuzla"
+  else
+    warn "Could not locate Rosette's package directory to link bitwuzla; Rosette verification may fail silently."
+  fi
+fi
+
 # ---------------------------------------------------------------------------
 # 3. LLVM for compilation (reuse the local LLVM 15 toolchain from step 1)
 #    Metalift's pass technically targets LLVM 11, but linking against 15
