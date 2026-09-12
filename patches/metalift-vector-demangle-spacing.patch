@@ -1,0 +1,20 @@
+diff --git a/metalift/frontend/llvm.py b/metalift/frontend/llvm.py
+index 6cdb40b2..77359d2e 100644
+--- a/metalift/frontend/llvm.py
++++ b/metalift/frontend/llvm.py
+@@ -52,9 +52,12 @@ ReturnValue = NamedTuple(
+ )
+ 
+ PRIMITIVE_TYPE_REGEX = r"[a-zA-Z]+"
+-PRIMITIVE_VECTOR_TYPE_REGEX = rf"(std::__1::vector<({PRIMITIVE_TYPE_REGEX}), std::__1::allocator<({PRIMITIVE_TYPE_REGEX})> >)"
+-NESTED_VECTOR_TYPE_REGEX = rf"(std::__1::vector<({PRIMITIVE_VECTOR_TYPE_REGEX}), std::__1::allocator<({PRIMITIVE_VECTOR_TYPE_REGEX}) > >)"
+-DOUBLE_NESTED_VECTOR_TYPE_REGEX = rf"(std::__1::vector<({NESTED_VECTOR_TYPE_REGEX}), std::__1::allocator<({NESTED_VECTOR_TYPE_REGEX}) > >)"
++# Demangler output varies on whether adjacent closing template angle brackets
++# get a separating space (pre-C++11-style "> >" vs. modern "->>"), so allow
++# either with `>\s*>` instead of requiring the literal space.
++PRIMITIVE_VECTOR_TYPE_REGEX = rf"(std::__1::vector<({PRIMITIVE_TYPE_REGEX}), std::__1::allocator<({PRIMITIVE_TYPE_REGEX})>\s*>)"
++NESTED_VECTOR_TYPE_REGEX = rf"(std::__1::vector<({PRIMITIVE_VECTOR_TYPE_REGEX}), std::__1::allocator<({PRIMITIVE_VECTOR_TYPE_REGEX})\s*>\s*>)"
++DOUBLE_NESTED_VECTOR_TYPE_REGEX = rf"(std::__1::vector<({NESTED_VECTOR_TYPE_REGEX}), std::__1::allocator<({NESTED_VECTOR_TYPE_REGEX})\s*>\s*>)"
+ 
+ GrammarT = Callable[[List[Object], List[Object], List[Object]], Bool]
+ 

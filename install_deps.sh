@@ -336,6 +336,26 @@ else
 fi
 
 # ---------------------------------------------------------------------------
+# 3.5 Apply local patches to the metalift submodule
+#     (compatibility fixes that haven't landed upstream)
+# ---------------------------------------------------------------------------
+if [[ -d "${REPO_ROOT}" && -d "${SCRIPT_DIR}/patches" ]]; then
+  shopt -s nullglob
+  for patch_file in "${SCRIPT_DIR}"/patches/*.patch; do
+    if git -C "${REPO_ROOT}" apply --check "${patch_file}" 2>/dev/null; then
+      info "Applying patch $(basename "${patch_file}") to metalift ..."
+      git -C "${REPO_ROOT}" apply "${patch_file}"
+      ok "Patch $(basename "${patch_file}") applied."
+    elif git -C "${REPO_ROOT}" apply --reverse --check "${patch_file}" 2>/dev/null; then
+      ok "Patch $(basename "${patch_file}") already applied."
+    else
+      warn "Patch $(basename "${patch_file}") doesn't apply cleanly (metalift may have changed upstream) — skipping."
+    fi
+  done
+  shopt -u nullglob
+fi
+
+# ---------------------------------------------------------------------------
 # 4. Python dependencies via Poetry
 # ---------------------------------------------------------------------------
 if [[ "${SKIP_POETRY}" -eq 1 ]]; then
@@ -356,6 +376,13 @@ else
   # Tell Poetry to use the local Python 3.10 (realpath to dodge symlink issues)
   poetry env use "$(realpath "${PYTHON_BIN}")"
   poetry install --no-interaction
+
+  # llmlift_scripts/ (used by the benchmarks/blend and benchmarks/llama
+  # drivers, and by our own verge_prompt_bridge.py) imports `anthropic` and
+  # `google.generativeai` at module load time, but metalift's pyproject.toml
+  # doesn't declare either as a dependency. Patch that gap here rather than
+  # depending on it having been fixed upstream.
+  poetry run pip install anthropic google-generativeai
 
   ok "Python dependencies installed."
 fi

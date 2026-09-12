@@ -18,10 +18,17 @@ verge/
 └── README.md                    # This file
 ```
 
-> **Status:** `metalift` and `levi` are vendored as git submodules; the glue code that drives
-> LEVI's evolution loop against metalift's verifier (the `demo/` folder and a VERGE-specific
-> `evolve_code()` integration) hasn't been written yet. Until then, use each project's own
-> examples directly — see [Try the projects directly](#try-the-projects-directly) below.
+> **Status:** `metalift` and `levi` are vendored as git submodules. A first working VERGE
+> loop exists at [`demo/prompt_evolution/run.py`](demo/prompt_evolution/run.py): LEVI evolves
+> the *prompt* metalift's synthesizer uses (not the DSL itself) for the `normal_blend_8`
+> benchmark, scored by actually running metalift + Rosette verification on each candidate.
+> It uses `levi.evolve_prompts` (evolving raw text). An earlier attempt used
+> `levi.evolve_code` to evolve metalift's `get_ps_prompt` function, but cheap models
+> produced invalid Python on ~100% of candidates — asking a small model to emit
+> multi-line prompt text *as Python source* is a losing proposition.
+> See [Run the prompt-evolution demo](#run-the-prompt-evolution-demo) below. Everything else
+> in the Architecture/Benchmarks sections further down (evolving the DSL grammar itself,
+> the other 4 example benchmarks) is still aspirational.
 
 ---
 
@@ -36,6 +43,12 @@ git clone --recurse-submodules <this-repo-url>
 # or, if you already cloned without that flag:
 git submodule update --init --recursive
 ```
+
+> Note: `git status` run *inside* `metalift/` or `levi/` reports on that submodule's own
+> repository, not this one — run it from the repo root to see your actual changes. Expect
+> `metalift/` to show modified content: that's the local patches in `patches/`, plus
+> `llmlift_scripts/dsl.py`, which metalift regenerates on every synthesis run
+> (`llmlift_scripts/parser.py` rewrites it). That file's churn is harmless — discard it.
 
 ### 1. Install dependencies
 
@@ -84,6 +97,48 @@ uv run python examples/quickstart/quickstart_prompts.py   # API key, prompt tuni
 
 The API-based scripts need `OPENAI_API_KEY` set (or edit `MODEL` at the top of the file for
 another [litellm provider](https://docs.litellm.ai/docs/providers)).
+
+### Run the prompt-evolution demo
+
+This is the first real VERGE loop — LEVI evolving something metalift actually verifies.
+Runs entirely on `WANDB_API_KEY` (from [wandb.ai/authorize](https://wandb.ai/authorize)) —
+both LEVI's proposer model and metalift's own internal synthesis calls route through W&B
+Inference (see `patches/metalift-wandb-inference-routing.patch`, applied automatically by
+`install_deps.sh`). Set `OPENAI_API_KEY` too if you'd rather metalift's internal calls use
+real GPT-4o instead of a W&B-hosted open-source model.
+
+```bash
+export WANDB_API_KEY=...
+cd levi
+uv run python ../demo/prompt_evolution/run.py
+```
+
+~5-15 minutes and a few dollars, since every LEVI evaluation runs a full metalift synthesis
++ Rosette verification attempt, not just a proposer call.
+
+**Weak vs. strong seed.** By default the demo starts from a deliberately *weak* prompt —
+it states the task but omits every constraint metalift's parser enforces (single return
+statement, no loops, no intermediate variables, semantic equivalence). That's the README's
+original premise, and it leaves real headroom for evolution to rediscover those rules.
+
+Run `VERGE_SEED=strong` to start from metalift's own hand-tuned production prompt instead.
+That one solves `normal_blend_8` on the first attempt with zero parser rejections — the
+minimum possible work — scoring ~0.996 with only wall-clock noise left as headroom. It's a
+useful comparison target, but evolution can only tie it, never beat it.
+
+**Self-correction.** Each evaluation returns `feedback_per_example` /
+`per_example_scores` alongside the score. LEVI samples these into its mutation prompt, so
+the proposer sees *why* a parent failed — metalift's actual parser errors, whether the
+rewrite parsed but failed verification, how many LLM round-trips it burned — and encodes
+those lessons into the next candidate rather than mutating blind on a scalar.
+
+**Scoring.** A candidate prompt scores 0.0 if metalift never verifies a rewrite with it.
+Otherwise it scores on efficiency: total LLM round-trips (PS + invariant attempts) dominate,
+parser rejections are penalised separately (output metalift can't parse is worse than output
+that parses but doesn't verify), and wall-clock breaks ties — roughly 0.50 to 0.99 in
+practice. The spread matters: an earlier version scored only on PS-attempt count, which
+collapsed to four possible values with the seed already at the ceiling, leaving evolution
+nothing to climb.
 
 ---
 
