@@ -98,6 +98,22 @@ uv run python examples/quickstart/quickstart_prompts.py   # API key, prompt tuni
 The API-based scripts need `OPENAI_API_KEY` set (or edit `MODEL` at the top of the file for
 another [litellm provider](https://docs.litellm.ai/docs/providers)).
 
+**metalift's classic Rosette tutorials** — pure grammar search, no LLM at all on metalift's
+side (only `tests/llvm/`, not `benchmarks/`; these match the original weak-seed-grammar
+premise directly, since `ps_grammar`/`inv_grammar` in the driver *are* the grammar):
+
+```bash
+cd metalift/tests/llvm
+bash compile-add-blocks.sh list_abs_sum.cc   # generates .ll/.loops (gitignored, not checked in)
+cd ../..
+poetry run python tests/llvm/list_abs_sum_driver.py
+```
+
+This needs no API key and no network access — Rosette solves it locally via Z3/bitwuzla in
+a few seconds. `compile-add-blocks.sh` and `gen_loops_file.py` were both patched to work on
+LLVM 15 (the tutorials were written against LLVM 11); see
+`patches/metalift-llvm15-compile-script-fix.patch` for the details of what changed and why.
+
 ### Run the prompt-evolution demo
 
 This is the first real VERGE loop — LEVI evolving something metalift actually verifies.

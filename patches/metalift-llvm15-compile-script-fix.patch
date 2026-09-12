@@ -1,0 +1,140 @@
+diff --git a/tests/llvm/compile-add-blocks.sh b/tests/llvm/compile-add-blocks.sh
+index d9771475..956cb80e 100755
+--- a/tests/llvm/compile-add-blocks.sh
++++ b/tests/llvm/compile-add-blocks.sh
+@@ -1,12 +1,35 @@
+ #!/usr/bin/env bash
+ 
+-# Compiles benchmark and runs switch converter and instruction namer on it
++# Compiles benchmark and runs switch converter and instruction namer on it.
++#
++# Updated for LLVM 15 (this originally targeted LLVM 11, per metalift's own
++# README). Three LLVM-15-vs-11 mismatches had to be worked around:
++#   1. `-O0` implies `optnone`, and LLVM 15's new pass manager silently skips
++#      *all* function passes/analyses on optnone functions (the legacy pass
++#      manager didn't apply this restriction to analysis printers). Disabled
++#      with -Xclang -disable-O0-optnone.
++#   2. LLVM 15 defaults to opaque pointers ("ptr"), but llvmlite (metalift's
++#      own IR parser, pinned to an older LLVM) can only read typed pointers
++#      ("i32*" etc). Disabled with -Xclang -no-opaque-pointers.
++#   3. Newer clang emits attribute keywords (mustprogress, Apple-Silicon ISA
++#      target-features) that llvmlite's parser doesn't recognize, aborting
++#      with "unterminated attribute group". Stripped post-compile, since
++#      metalift's symbolic analysis doesn't need codegen attributes anyway.
++# Also: `opt -analyze -loops` (the legacy per-function loop-info printer) was
++# removed entirely after LLVM 11; gen_loops_file.py reconstructs the same
++# textual format metalift's parse_loops() expects, using the new pass manager.
++#
++# The original hardcoded -I into a specific Xcode SDK's usr/include; that's
++# been dropped; it doesn't work with either Homebrew's or Apple's default
++# clang -- it injects a C header search path that conflicts with either
++# clang's own paired libc++, causing "didn't find libc++'s <string.h>
++# header" or "no member named 'nullptr_t'" errors. Both clangs find their
++# own SDK/libc++ pairing correctly without it.
+ 
+-include_path="/Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX.sdk/usr/include"
++SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ 
+ process_file() {
+     file="$1"
+-    ext="${file##*.}"
+     dir=$(dirname "$file")
+     filename=$(basename "$file")
+     base="${filename%.*}"
+@@ -16,18 +39,30 @@ process_file() {
+ 
+     if [[ $file == *.c ]]
+     then
+-      clang -O0 -I "$include_path" -I../../headers -c -emit-llvm -fno-discard-value-names -S "$file" -o "$clang_out"
++      clang -Xclang -disable-O0-optnone -Xclang -no-opaque-pointers -O0 -I../../headers -c -emit-llvm -fno-discard-value-names -S "$file" -o "$clang_out"
+     else
+-      clang++ -stdlib=libc++ -O0 -I "$include_path" -I../../headers -c -emit-llvm -fno-discard-value-names -S "$file" -o "$clang_out"
++      clang++ -stdlib=libc++ -Xclang -disable-O0-optnone -Xclang -no-opaque-pointers -O0 -I../../headers -c -emit-llvm -fno-discard-value-names -S "$file" -o "$clang_out"
+     fi
+ 
++    python3 - "$clang_out" <<'PYEOF'
++import re
++import sys
++path = sys.argv[1]
++with open(path) as f:
++    ir = f.read()
++ir = re.sub(r'^attributes #\d+ = .*\n?', '', ir, flags=re.MULTILINE)
++ir = re.sub(r' #\d+(?=\s*\{|\s*$)', '', ir, flags=re.MULTILINE)
++with open(path, 'w') as f:
++    f.write(ir)
++PYEOF
++
+     opt -load ../../llvm-pass/build/addEmptyBlocks/libAddEmptyBlocksPass.so -addEmptyBlock -lowerinvoke --unreachableblockelim -instnamer -S "$clang_out" > "$dir/tmp.ll"
+ 
+     mv "$dir/tmp.ll" "$clang_out"
+ 
+     loops_out="$dir/$base.loops"
+     echo "output loops info to:" $loops_out
+-    opt -analyze -loops "$clang_out" > "$loops_out"
++    python3 "${SCRIPT_DIR}/gen_loops_file.py" "$clang_out" "$loops_out"
+ }
+ 
+ if [ "$1" == "ALL" ]; then
+diff --git a/tests/llvm/gen_loops_file.py b/tests/llvm/gen_loops_file.py
+new file mode 100644
+index 00000000..20c4eff9
+--- /dev/null
++++ b/tests/llvm/gen_loops_file.py
+@@ -0,0 +1,57 @@
++#!/usr/bin/env python3
++"""Regenerate the legacy `-analyze -loops` textual format metalift's
++`parse_loops()` (metalift/frontend/llvm.py) expects, using LLVM 15's new
++pass manager.
++
++`opt -analyze -loops` was removed after LLVM 11 (the version metalift's own
++compile-add-blocks.sh targets). The new-PM replacement, `print<loops>`,
++drops the per-function
++    Printing analysis 'Natural Loop Information' for function '<name>':
++header line metalift's parser keys on, and -filter-print-funcs (meant to
++scope the printer to one function) is not honored by this pass either --
++verified empirically, it prints every function's loops regardless.
++
++Instead we run with -debug-pass-manager, which logs "Running pass:
++LoopPrinterPass on <name>" immediately before that function's own loop
++lines on the same stream (verified: interleaving matches pass-manager
++scheduling order exactly). We reconstruct the legacy header from that.
++
++Usage: gen_loops_file.py <input.ll> <output.loops>
++"""
++
++import re
++import subprocess
++import sys
++
++RUNNING_RE = re.compile(r"^Running pass: LoopPrinterPass on (\S+)")
++
++
++def generate(ll_path: str) -> str:
++    proc = subprocess.run(
++        ["opt", "-debug-pass-manager", "-passes=function(print<loops>)", ll_path, "-o", "/dev/null"],
++        capture_output=True,
++        text=True,
++        check=True,
++    )
++    lines_out = []
++    for line in proc.stderr.splitlines():
++        match = RUNNING_RE.match(line)
++        if match:
++            fn_name = match.group(1)
++            lines_out.append(f"Printing analysis 'Natural Loop Information' for function '{fn_name}':")
++        elif line.startswith("Loop at depth"):
++            lines_out.append(line)
++    return "\n".join(lines_out) + "\n"
++
++
++def main() -> None:
++    if len(sys.argv) != 3:
++        print("usage: gen_loops_file.py <input.ll> <output.loops>", file=sys.stderr)
++        sys.exit(1)
++    output = generate(sys.argv[1])
++    with open(sys.argv[2], "w") as f:
++        f.write(output)
++
++
++if __name__ == "__main__":
++    main()
