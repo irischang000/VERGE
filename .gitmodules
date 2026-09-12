@@ -1,0 +1,6 @@
+[submodule "metalift"]
+	path = metalift
+	url = https://github.com/metalift/metalift.git
+[submodule "levi"]
+	path = levi
+	url = https://github.com/ttanv/levi.git

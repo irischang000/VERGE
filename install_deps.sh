@@ -6,27 +6,32 @@
 #   bash install_deps.sh [--prefix <dir>] [--skip-racket] [--skip-llvm]
 #                        [--skip-poetry] [--skip-llvm-pass] [--skip-bitwuzla]
 #
-# Run from the verge root directory.
+# Can be run from anywhere; paths are resolved relative to this script's
+# location (assumed to be the verge repo root).
 #
 # What this script does:
-#   1. Prepends site packages (Python 3.10, Poetry, CVC5, CMake, LLVM 15)
-#      from /grid/common/pkgs/ onto PATH / LD_LIBRARY_PATH.
+#   1. Resolves Python 3.10, Poetry, CVC5, CMake, and LLVM 15 locally
+#      (Homebrew on macOS, apt/dnf on Linux; CVC5 always via GitHub release)
+#      and prepends them onto PATH / LD_LIBRARY_PATH, installing anything
+#      that isn't already present.
 #   2. Downloads & installs Racket 8.12 + Rosette into --prefix (default
-#      /lan/csv/orion_t1_v1/ihchang/verge/deps) if not already present.
+#      <repo-root>/deps) if not already present.
 #   2.5 Downloads bitwuzla (SMT solver used by Rosette) into --prefix.
-#   3. Downloads a pre-built LLVM 11 clang/opt into --prefix for compiling
-#      LLVM IR (Metalift currently requires LLVM 11 for the pass).
+#   3. Reuses the local LLVM 15 toolchain for compiling LLVM IR (Metalift's
+#      pass technically targets LLVM 11, but 15 is ABI-compatible for this).
 #   4. Installs Python dependencies via Poetry (poetry install).
 #   5. Builds the custom LLVM pass (llvm-pass/).
-#   6. Prints a shell snippet you can paste into ~/.bashrc / ~/.bash_profile.
+#   6. Prints a shell snippet you can paste into ~/.bashrc / ~/.zshrc.
 # =============================================================================
 
 set -euo pipefail
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
 # ---------------------------------------------------------------------------
 # Defaults
 # ---------------------------------------------------------------------------
-PREFIX="/lan/csv/orion_t1_v1/ihchang/verge/deps"
+PREFIX="${SCRIPT_DIR}/deps"
 SKIP_RACKET=0
 SKIP_LLVM=0
 SKIP_POETRY=0
@@ -45,12 +50,12 @@ while [[ $# -gt 0 ]]; do
     --skip-llvm-pass) SKIP_LLVM_PASS=1; shift ;;
     --skip-bitwuzla) SKIP_BITWUZLA=1; shift ;;
     -h|--help)
-      sed -n '2,20p' "$0"; exit 0 ;;
+      sed -n '2,23p' "$0"; exit 0 ;;
     *) echo "Unknown option: $1"; exit 1 ;;
   esac
 done
 
-REPO_ROOT="/lan/csv/orion_t1_v1/ihchang/verge/metalift"
+REPO_ROOT="${SCRIPT_DIR}/metalift"
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -62,39 +67,144 @@ die()   { echo -e "\033[1;31m[ERR ]\033[0m  $*" >&2; exit 1; }
 
 need_cmd() { command -v "$1" &>/dev/null || die "Required command not found: $1"; }
 
+# macOS quarantines files downloaded via curl/https; strip that so the
+# extracted binaries can execute without a Gatekeeper prompt.
+dequarantine() {
+  if [[ "${OS}" == "Darwin" ]]; then
+    xattr -dr com.apple.quarantine "$1" 2>/dev/null || true
+  fi
+}
+
+nproc_portable() {
+  if command -v nproc &>/dev/null; then
+    nproc
+  else
+    sysctl -n hw.ncpu 2>/dev/null || echo 4
+  fi
+}
+
 # ---------------------------------------------------------------------------
-# 1. Site packages from /grid/common/pkgs/
+# 1. Local toolchain: Python 3.10, Poetry, CVC5, CMake, LLVM 15
+#    (previously a shared /grid/common/pkgs/ mount — now resolved locally)
 # ---------------------------------------------------------------------------
-GRID_PKGS=/grid/common/pkgs
+OS="$(uname -s)"
+case "$(uname -m)" in
+  x86_64|amd64)  ARCH_TAG="x86_64" ;;
+  arm64|aarch64) ARCH_TAG="arm64" ;;
+  *) die "Unsupported architecture: $(uname -m)" ;;
+esac
 
-info "Prepending site packages from ${GRID_PKGS} ..."
+info "Detected ${OS}/${ARCH_TAG}. Resolving local toolchain ..."
 
-# Python 3.10 (vanilla build – clean ssl/venv)
-PYTHON_HOME="${GRID_PKGS}/python/v3.10.8"
-[[ -d "${PYTHON_HOME}/bin" ]] || die "Python 3.10 not found at ${PYTHON_HOME}"
+if [[ "${OS}" == "Darwin" ]]; then
+  command -v brew &>/dev/null || die "Homebrew not found. Install it from https://brew.sh and re-run."
 
-# Poetry
-POETRY_HOME="${GRID_PKGS}/poetry/v2.1"
-[[ -d "${POETRY_HOME}/bin" ]] || die "Poetry not found at ${POETRY_HOME}"
+  brew_prefix() {
+    local formula="$1"
+    if ! brew list --formula --versions "${formula}" &>/dev/null; then
+      info "Installing ${formula} via Homebrew ..."
+      brew install "${formula}"
+    fi
+    brew --prefix "${formula}"
+  }
 
-# CVC5
-CVC5_HOME="${GRID_PKGS}/cvc5/v1.3.1"
-[[ -d "${CVC5_HOME}/bin" ]] || die "CVC5 not found at ${CVC5_HOME}"
+  PYTHON_HOME="$(brew_prefix python@3.10)"
+  PYTHON_BIN="${PYTHON_HOME}/bin/python3.10"
+  # Homebrew keeps the unversioned python3/pip3 symlinks in libexec/bin so
+  # they don't clobber a separately-installed `python3` formula.
+  PYTHON_UNVERSIONED_BIN="${PYTHON_HOME}/libexec/bin"
+  CMAKE_HOME="$(brew_prefix cmake)"
+  LLVM15_HOME="$(brew_prefix llvm@15)"
 
-# CMake (needed to build the LLVM pass)
-CMAKE_HOME="${GRID_PKGS}/cmake/v3.30"
-[[ -d "${CMAKE_HOME}/bin" ]] || CMAKE_HOME="${GRID_PKGS}/cmake/v3.28.2"
-[[ -d "${CMAKE_HOME}/bin" ]] || CMAKE_HOME="${GRID_PKGS}/cmake/latest"
-[[ -d "${CMAKE_HOME}/bin" ]] || die "CMake not found under ${GRID_PKGS}/cmake"
+elif [[ "${OS}" == "Linux" ]]; then
+  if command -v apt-get &>/dev/null; then
+    PKG_INSTALL=(sudo apt-get install -y)
+    sudo apt-get update -y
+  elif command -v dnf &>/dev/null; then
+    PKG_INSTALL=(sudo dnf install -y)
+  else
+    die "No supported package manager (apt-get/dnf) found; install Python 3.10, CMake, and LLVM 15 manually."
+  fi
 
-# LLVM 15 (Cadence build – glibc-compatible with RHEL 8)
-LLVM15_HOME="${GRID_PKGS}/llvm/ps2025"
-[[ -d "${LLVM15_HOME}/bin" ]] || die "LLVM 15 not found at ${LLVM15_HOME}"
+  command -v python3.10 &>/dev/null || "${PKG_INSTALL[@]}" python3.10 python3.10-venv python3.10-dev \
+    || die "Could not install python3.10 automatically; install it manually for your distro."
+  PYTHON_BIN="$(command -v python3.10)"
+  PYTHON_HOME="$(dirname "$(dirname "${PYTHON_BIN}")")"
+  PYTHON_UNVERSIONED_BIN=""
 
-export PATH="${PYTHON_HOME}/bin:${POETRY_HOME}/bin:${CVC5_HOME}/bin:${CMAKE_HOME}/bin:${LLVM15_HOME}/bin:${PATH}"
-# NOTE: do NOT add Python's lib/ to LD_LIBRARY_PATH – its bundled OpenSSL
-# overrides the system libssl and breaks kerberos/cmake (EVP_KDF_ctrl error).
-export LD_LIBRARY_PATH="${LLVM15_HOME}/lib:${LD_LIBRARY_PATH:-}"
+  command -v cmake &>/dev/null || "${PKG_INSTALL[@]}" cmake
+  CMAKE_HOME="$(dirname "$(dirname "$(command -v cmake)")")"
+
+  command -v clang-15 &>/dev/null || "${PKG_INSTALL[@]}" llvm-15 clang-15 \
+    || die "Could not install LLVM 15 automatically; see https://apt.llvm.org for manual instructions."
+  LLVM15_HOME="$(dirname "$(dirname "$(command -v clang-15)")")"
+
+else
+  die "Unsupported OS: ${OS}"
+fi
+
+ok "Python 3.10  -> ${PYTHON_HOME}"
+ok "CMake        -> ${CMAKE_HOME}"
+ok "LLVM 15      -> ${LLVM15_HOME}"
+
+# ---- Poetry (installed the same way on every OS, pinned near grid's v2.1) -
+POETRY_HOME="${PREFIX}/poetry"
+POETRY_VERSION="2.1.4"
+if [[ -x "${POETRY_HOME}/bin/poetry" ]]; then
+  ok "Poetry already installed at ${POETRY_HOME}."
+else
+  info "Installing Poetry ${POETRY_VERSION} into ${POETRY_HOME} ..."
+  need_cmd curl
+  curl -sSL https://install.python-poetry.org \
+    | POETRY_HOME="${POETRY_HOME}" POETRY_VERSION="${POETRY_VERSION}" "${PYTHON_BIN}" -
+  ok "Poetry installed."
+fi
+
+# ---- CVC5 (no Homebrew/distro package; always fetched from GitHub) -------
+CVC5_VERSION="1.3.1"
+CVC5_HOME="${PREFIX}/cvc5"
+CVC5_BIN="${CVC5_HOME}/bin/cvc5"
+
+if [[ -x "${CVC5_BIN}" ]]; then
+  ok "cvc5 already installed at ${CVC5_BIN}."
+else
+  case "${OS}" in
+    Darwin) CVC5_OS_TAG="macOS" ;;
+    Linux)  CVC5_OS_TAG="Linux" ;;
+  esac
+  CVC5_ASSET="cvc5-${CVC5_OS_TAG}-${ARCH_TAG}-static"
+  CVC5_URL="https://github.com/cvc5/cvc5/releases/download/cvc5-${CVC5_VERSION}/${CVC5_ASSET}.zip"
+  CVC5_TMP="/tmp/${CVC5_ASSET}.zip"
+
+  info "Downloading cvc5 ${CVC5_VERSION} (${CVC5_ASSET}) ..."
+  need_cmd curl
+  need_cmd unzip
+  curl -fsSL --retry 5 --retry-delay 3 "${CVC5_URL}" -o "${CVC5_TMP}" \
+    || die "Failed to download cvc5 from ${CVC5_URL}"
+
+  rm -rf "${CVC5_HOME}"
+  mkdir -p "${CVC5_HOME}"
+  unzip -q "${CVC5_TMP}" -d "${CVC5_HOME}"
+  # Release zip wraps everything in a top-level "<asset-name>/" directory.
+  mv "${CVC5_HOME}/${CVC5_ASSET}"/* "${CVC5_HOME}/"
+  rmdir "${CVC5_HOME}/${CVC5_ASSET}"
+  rm -f "${CVC5_TMP}"
+  chmod +x "${CVC5_BIN}"
+  dequarantine "${CVC5_HOME}"
+
+  [[ -x "${CVC5_BIN}" ]] || die "cvc5 binary not found after extraction at ${CVC5_BIN}"
+  ok "cvc5 installed at ${CVC5_BIN}."
+fi
+
+export PATH="${PYTHON_UNVERSIONED_BIN:+${PYTHON_UNVERSIONED_BIN}:}${PYTHON_HOME}/bin:${POETRY_HOME}/bin:${CVC5_HOME}/bin:${CMAKE_HOME}/bin:${LLVM15_HOME}/bin:${PATH}"
+
+if [[ "${OS}" == "Linux" ]]; then
+  # NOTE: do NOT add Python's lib/ to LD_LIBRARY_PATH – its bundled OpenSSL
+  # overrides the system libssl and breaks kerberos/cmake (EVP_KDF_ctrl error).
+  export LD_LIBRARY_PATH="${LLVM15_HOME}/lib:${LD_LIBRARY_PATH:-}"
+fi
+# macOS: no LD_LIBRARY_PATH/DYLD_LIBRARY_PATH needed — Homebrew's LLVM dylibs
+# are resolved via install-name rpaths.
 
 ok "PATH updated."
 python3 --version
@@ -114,24 +224,43 @@ else
   if [[ -x "${RACKET_BIN}" ]]; then
     ok "Racket already installed at ${RACKET_BIN}."
   else
-    info "Downloading Racket 8.12 installer ..."
-    RACKET_INSTALLER_URL="https://mirror.racket-lang.org/installers/8.12/racket-8.12-x86_64-linux-cs.sh"
-    RACKET_INSTALLER="/tmp/racket-8.12-installer.sh"
-
     need_cmd curl
-    curl -fsSL --retry 5 --retry-delay 3 \
-      "${RACKET_INSTALLER_URL}" -o "${RACKET_INSTALLER}"
-    chmod +x "${RACKET_INSTALLER}"
-
-    info "Installing Racket into ${RACKET_PREFIX} ..."
-    # Remove any partial/empty dir so the installer doesn't prompt "delete?"
     rm -rf "${RACKET_PREFIX}"
-    mkdir -p "$(dirname "${RACKET_PREFIX}")"
-    # Use non-interactive in-place install flags
-    bash "${RACKET_INSTALLER}" --in-place --dest "${RACKET_PREFIX}"
+    mkdir -p "${RACKET_PREFIX}"
+
+    if [[ "${OS}" == "Darwin" ]]; then
+      # Racket's macOS asset names use "aarch64", not "arm64".
+      RACKET_ARCH_TAG="${ARCH_TAG}"
+      [[ "${RACKET_ARCH_TAG}" == "arm64" ]] && RACKET_ARCH_TAG="aarch64"
+      RACKET_ASSET="racket-minimal-8.12-${RACKET_ARCH_TAG}-macosx-cs"
+      RACKET_URL="https://mirror.racket-lang.org/installers/8.12/${RACKET_ASSET}.tgz"
+      RACKET_TMP="/tmp/${RACKET_ASSET}.tgz"
+
+      info "Downloading Racket 8.12 (${RACKET_ASSET}) ..."
+      curl -fsSL --retry 5 --retry-delay 3 "${RACKET_URL}" -o "${RACKET_TMP}" \
+        || die "Failed to download Racket from ${RACKET_URL}"
+
+      # Tarball wraps everything in a top-level "racket/" directory.
+      tar -xzf "${RACKET_TMP}" -C "${RACKET_PREFIX}" --strip-components=1
+      rm -f "${RACKET_TMP}"
+      dequarantine "${RACKET_PREFIX}"
+    else
+      [[ "${ARCH_TAG}" == "x86_64" ]] \
+        || die "Racket 8.12 has no official Linux ${ARCH_TAG} build; install Racket manually or pass --skip-racket."
+
+      RACKET_INSTALLER_URL="https://mirror.racket-lang.org/installers/8.12/racket-8.12-x86_64-linux-cs.sh"
+      RACKET_INSTALLER="/tmp/racket-8.12-installer.sh"
+
+      curl -fsSL --retry 5 --retry-delay 3 \
+        "${RACKET_INSTALLER_URL}" -o "${RACKET_INSTALLER}"
+      chmod +x "${RACKET_INSTALLER}"
+
+      info "Installing Racket into ${RACKET_PREFIX} ..."
+      bash "${RACKET_INSTALLER}" --in-place --dest "${RACKET_PREFIX}"
+      rm -f "${RACKET_INSTALLER}"
+    fi
 
     ok "Racket installed."
-    rm -f "${RACKET_INSTALLER}"
   fi
 
   # Always ensure Rosette is installed (idempotent)
@@ -161,9 +290,13 @@ if [[ "${SKIP_BITWUZLA}" -eq 1 ]]; then
 elif [[ -x "${BITWUZLA_BIN}" ]]; then
   ok "bitwuzla already installed at ${BITWUZLA_BIN}."
 else
-  info "Downloading bitwuzla ${BITWUZLA_VERSION} for Linux x86_64 ..."
-  # Release asset: Bitwuzla-<ver>-Linux-x86_64-static.zip
-  BITWUZLA_ASSET="Bitwuzla-${BITWUZLA_VERSION}-Linux-x86_64-static"
+  case "${OS}" in
+    Darwin) BITWUZLA_OS_TAG="macOS" ;;
+    Linux)  BITWUZLA_OS_TAG="Linux" ;;
+  esac
+  info "Downloading bitwuzla ${BITWUZLA_VERSION} for ${BITWUZLA_OS_TAG} ${ARCH_TAG} ..."
+  # Release asset naming (no version in the filename): Bitwuzla-<OS>-<arch>-static.zip
+  BITWUZLA_ASSET="Bitwuzla-${BITWUZLA_OS_TAG}-${ARCH_TAG}-static"
   BITWUZLA_URL="https://github.com/bitwuzla/bitwuzla/releases/download/${BITWUZLA_VERSION}/${BITWUZLA_ASSET}.zip"
   BITWUZLA_TMP="/tmp/bitwuzla-${BITWUZLA_VERSION}.zip"
 
@@ -180,6 +313,7 @@ else
   mv "${BITWUZLA_DIR}/bin/${BITWUZLA_ASSET}/bin/bitwuzla" "${BITWUZLA_BIN}"
   rm -rf "${BITWUZLA_DIR}/bin/${BITWUZLA_ASSET}" "${BITWUZLA_TMP}"
   chmod +x "${BITWUZLA_BIN}"
+  dequarantine "${BITWUZLA_DIR}"
 
   [[ -x "${BITWUZLA_BIN}" ]] || die "bitwuzla binary not found after extraction at ${BITWUZLA_BIN}"
   ok "bitwuzla installed at ${BITWUZLA_BIN}."
@@ -188,17 +322,17 @@ fi
 export BITWUZLA_PATH="${BITWUZLA_BIN}"
 
 # ---------------------------------------------------------------------------
-# 3. LLVM for compilation (use grid LLVM 15 – glibc-compatible with RHEL 8)
-#    The downloaded LLVM 11 Ubuntu prebuilts require glibc 2.32 which RHEL 8
-#    does not have. LLVM 15 from /grid/common/pkgs/ is built for this system.
+# 3. LLVM for compilation (reuse the local LLVM 15 toolchain from step 1)
+#    Metalift's pass technically targets LLVM 11, but linking against 15
+#    avoids managing a second, separately-versioned LLVM install.
 # ---------------------------------------------------------------------------
-LLVM11_PREFIX="${LLVM15_HOME}"   # alias: reuse LLVM 15 from grid
+LLVM11_PREFIX="${LLVM15_HOME}"   # alias: reuse local LLVM 15
 LLVM11_BIN="${LLVM15_HOME}/bin/clang"
 
 if [[ "${SKIP_LLVM}" -eq 1 ]]; then
   warn "Skipping LLVM check (--skip-llvm)."
 else
-  ok "Using grid LLVM 15 at ${LLVM15_HOME} (glibc-compatible with RHEL 8)."
+  ok "Using local LLVM 15 at ${LLVM15_HOME}."
 fi
 
 # ---------------------------------------------------------------------------
@@ -219,9 +353,8 @@ else
   export POETRY_CONFIG_DIR="${PREFIX}/poetry-config"
   mkdir -p "${POETRY_CACHE_DIR}" "${POETRY_DATA_DIR}" "${POETRY_CONFIG_DIR}"
 
-  # Tell Poetry to use the site-packages Python 3.10 (use realpath to avoid symlink issues)
-  PYTHON3_BIN="$(realpath "${PYTHON_HOME}/bin/python3")"
-  poetry env use "${PYTHON3_BIN}"
+  # Tell Poetry to use the local Python 3.10 (realpath to dodge symlink issues)
+  poetry env use "$(realpath "${PYTHON_BIN}")"
   poetry install --no-interaction
 
   ok "Python dependencies installed."
@@ -238,7 +371,7 @@ else
   mkdir -p build
   cd build
 
-  # Point CMake at grid LLVM 15 (glibc-compatible)
+  # Point CMake at the local LLVM 15
   LLVM_CMAKE_DIR="${LLVM15_HOME}/lib/cmake/llvm"
 
   if [[ -d "${LLVM_CMAKE_DIR}" ]]; then
@@ -248,7 +381,7 @@ else
     cmake ..
   fi
 
-  make -j"$(nproc)"
+  make -j"$(nproc_portable)"
   cd "${REPO_ROOT}"
   ok "LLVM pass built: llvm-pass/build/addEmptyBlocks/libAddEmptyBlocksPass.so"
 fi
@@ -256,15 +389,24 @@ fi
 # ---------------------------------------------------------------------------
 # 6. Print environment snippet
 # ---------------------------------------------------------------------------
+SHELL_RC="~/.bashrc or ~/.bash_profile"
+[[ "${OS}" == "Darwin" ]] && SHELL_RC="~/.zshrc"
+
 cat <<EOF
 
 =============================================================================
-  Setup complete!  Add the following to your ~/.bashrc or ~/.bash_profile:
+  Setup complete!  Add the following to your ${SHELL_RC}:
 =============================================================================
 
 # --- Metalift environment ---
-export PATH="${PYTHON_HOME}/bin:${POETRY_HOME}/bin:${CVC5_HOME}/bin:${CMAKE_HOME}/bin:${LLVM15_HOME}/bin:\${PATH}"
-export LD_LIBRARY_PATH="${LLVM15_HOME}/lib:\${LD_LIBRARY_PATH:-}"
+export PATH="${PYTHON_UNVERSIONED_BIN:+${PYTHON_UNVERSIONED_BIN}:}${PYTHON_HOME}/bin:${POETRY_HOME}/bin:${CVC5_HOME}/bin:${CMAKE_HOME}/bin:${LLVM15_HOME}/bin:\${PATH}"
+EOF
+
+if [[ "${OS}" == "Linux" ]]; then
+  echo "export LD_LIBRARY_PATH=\"${LLVM15_HOME}/lib:\${LD_LIBRARY_PATH:-}\""
+fi
+
+cat <<EOF
 export PYTHON_KEYRING_BACKEND=keyring.backends.null.Keyring
 export POETRY_CACHE_DIR="${PREFIX}/poetry-cache"
 export POETRY_DATA_DIR="${PREFIX}/poetry-data"
@@ -276,10 +418,10 @@ if [[ -x "${RACKET_BIN}" ]]; then
   echo "export PATH=\"${RACKET_PREFIX}/bin:\${PATH}\""
 fi
 
-cat <<'EOF'
+cat <<EOF
 
 # Activate the virtualenv (Poetry 2.x removed 'poetry shell'):
-#   source /lan/csv/orion_t1_v1/ihchang/verge/metalift/.venv/bin/activate
+#   source ${REPO_ROOT}/.venv/bin/activate
 # Or run a single command without activating:
 #   poetry run python <script.py>
 =============================================================================
