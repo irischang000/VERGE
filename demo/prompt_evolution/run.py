@@ -51,16 +51,13 @@ from pathlib import Path
 
 import levi
 
-REPO_ROOT = Path(__file__).resolve().parent.parent.parent
-METALIFT_DIR = REPO_ROOT / "metalift"
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+from _verge_bridge import METALIFT_DIR, POETRY_BIN, bridge_env  # noqa: E402
+
 # Bridge script lives alongside this file (not inside the metalift submodule,
 # which is untracked/opaque to our own repo) but runs with cwd=METALIFT_DIR
 # so its relative benchmark paths resolve.
 BRIDGE_SCRIPT = Path(__file__).resolve().parent / "verge_prompt_bridge.py"
-# Absolute path, not just "poetry" -- this runs inside LEVI's own uv-managed
-# subprocess/eval workers, whose PATH won't have install_deps.sh's toolchain
-# exports unless the caller's shell happened to have sourced them too.
-POETRY_BIN = REPO_ROOT / "deps" / "poetry" / "bin" / "poetry"
 BENCHMARK_NAME = "normal_blend_8"
 
 # Routed through W&B Inference (uses your hackathon W&B credits) via litellm's
@@ -146,48 +143,6 @@ verification, and to do so in fewer retries.
 """
 
 
-def _brew_prefix(formula: str) -> str | None:
-    try:
-        result = subprocess.run(
-            ["brew", "--prefix", formula], capture_output=True, text=True, check=True
-        )
-        return result.stdout.strip()
-    except (FileNotFoundError, subprocess.CalledProcessError):
-        return None
-
-
-def _bridge_env() -> dict:
-    """Build a subprocess environment with the full toolchain on PATH,
-    independent of whatever shell launched this script -- LEVI's own eval
-    workers won't have sourced install_deps.sh's printed PATH exports, and
-    metalift itself shells out to bare `racket`/`cvc5` internally."""
-    env = os.environ.copy()
-    # This script runs inside `uv run`, which sets VIRTUAL_ENV to LEVI's own
-    # Python 3.11 venv. Poetry respects that convention and would otherwise
-    # treat it as "already active", ignoring metalift's pinned 3.10 .venv.
-    env.pop("VIRTUAL_ENV", None)
-    path_parts = []
-    for formula in ("python@3.10", "cmake", "llvm@15"):
-        prefix = _brew_prefix(formula)
-        if prefix:
-            path_parts.append(f"{prefix}/bin")
-    path_parts.append(str(REPO_ROOT / "deps" / "racket" / "bin"))
-    path_parts.append(str(REPO_ROOT / "deps" / "cvc5" / "bin"))
-    env["PATH"] = ":".join(path_parts) + ":" + env.get("PATH", "")
-    env["BITWUZLA_PATH"] = str(REPO_ROOT / "deps" / "bitwuzla" / "bin" / "bitwuzla")
-
-    # Poetry's own venv-selection state (from `poetry env use` in
-    # install_deps.sh) lives under these redirected config dirs -- without
-    # them Poetry falls back to its default ~/.config/pypoetry, doesn't find
-    # the pinned Python 3.10 venv, and picks whatever python3 it finds on
-    # PATH instead (breaking metalift's `python = ">=3.9,<3.11"` constraint).
-    env["PYTHON_KEYRING_BACKEND"] = "keyring.backends.null.Keyring"
-    env["POETRY_CACHE_DIR"] = str(REPO_ROOT / "deps" / "poetry-cache")
-    env["POETRY_DATA_DIR"] = str(REPO_ROOT / "deps" / "poetry-data")
-    env["POETRY_CONFIG_DIR"] = str(REPO_ROOT / "deps" / "poetry-config")
-    return env
-
-
 def score(prompt: str, _inputs=None) -> dict:
     """Actually run metalift synthesis with the evolved prompt and see if it verifies."""
     with tempfile.NamedTemporaryFile(
@@ -200,7 +155,7 @@ def score(prompt: str, _inputs=None) -> dict:
         proc = subprocess.run(
             [str(POETRY_BIN), "run", "python", str(BRIDGE_SCRIPT), evolved_path, BENCHMARK_NAME],
             cwd=METALIFT_DIR,
-            env=_bridge_env(),
+            env=bridge_env(),
             capture_output=True,
             text=True,
             timeout=EVAL_TIMEOUT_SECONDS,
