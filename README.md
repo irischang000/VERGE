@@ -114,6 +114,23 @@ a few seconds. `compile-add-blocks.sh` and `gen_loops_file.py` were both patched
 LLVM 15 (the tutorials were written against LLVM 11); see
 `patches/metalift-llvm15-compile-script-fix.patch` for the details of what changed and why.
 
+**metalift's Python-source tutorials** (`tests/python/`) — same idea, but working directly
+from Python source instead of compiled LLVM IR, so there's no clang/opt toolchain involved
+at all. All 16 pass:
+
+```bash
+poetry run bash tests/python/run_all_tests.sh
+```
+
+(`run_all_tests.sh` stops at the first failure; loop over `tests/python/*_driver.py`
+yourself with a per-file `timeout` if you want to see every result instead of just the
+first one.) This uncovered a real bug in `metalift/frontend/python.py` that blocked all
+16 drivers uniformly — `gen_Synth()` never passed the `relaxed` argument its own grammar
+functions require — plus one driver-specific bug in `tuples1_driver.py` (`make_tuple` was
+imported but never called; `x_tuple`/`y_tuple` were referenced but never defined). Both
+fixed in `patches/metalift-python-frontend-relaxed-arg.patch` and
+`patches/metalift-tuples1-driver-fix.patch`.
+
 ### Run the prompt-evolution demo
 
 This is the first real VERGE loop — LEVI evolving something metalift actually verifies.

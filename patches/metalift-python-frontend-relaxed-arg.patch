@@ -1,0 +1,26 @@
+diff --git a/metalift/frontend/python.py b/metalift/frontend/python.py
+index 3f750763..4388f0e5 100644
+--- a/metalift/frontend/python.py
++++ b/metalift/frontend/python.py
+@@ -1,4 +1,5 @@
+ import copy
++import inspect
+ import re
+ from typing import Any, Callable, Dict, List, Optional, Set, Tuple, TypeVar, Union, cast
+ 
+@@ -238,7 +239,14 @@ class Predicate:
+         return cast(Bool, call_ret)
+ 
+     def gen_Synth(self) -> Synth:
+-        body = self.grammar(self.writes, self.reads, self.in_scope).src
++        # `grammar` is either an inv_grammar(writes, reads, in_scope, relaxed)
++        # or a ps_grammar(writes, reads, in_scope) -- this single call site
++        # handles predicates of both shapes, so relaxed can only be passed
++        # when the callable actually accepts it.
++        if "relaxed" in inspect.signature(self.grammar).parameters:
++            body = self.grammar(self.writes, self.reads, self.in_scope, relaxed=False).src
++        else:
++            body = self.grammar(self.writes, self.reads, self.in_scope).src
+         return Synth(self.name, body, *get_object_exprs(*self.args))
+ 
+ 
