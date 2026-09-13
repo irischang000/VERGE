@@ -50,6 +50,7 @@ import tempfile
 from pathlib import Path
 
 import levi
+import weave
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from _verge_bridge import METALIFT_DIR, POETRY_BIN, bridge_env  # noqa: E402
@@ -66,6 +67,28 @@ BENCHMARK_NAME = "normal_blend_8"
 MODEL = "wandb/Qwen/Qwen3-235B-A22B-Instruct-2507"
 BUDGET_DOLLARS = 0.50
 EVAL_TIMEOUT_SECONDS = 300.0
+WEAVE_PROJECT = "verge-prompt-evolution"
+
+# LEVI's ResilientProcessPool runs every score_fn call in a brand-new `spawn`
+# subprocess (levi/utils/resilient_pool.py) that's killed (proc.terminate(),
+# then proc.kill() if needed) the instant it reads a result off the queue --
+# so a subprocess's own weave client, whose uploads happen on a background
+# thread, can easily get killed mid-upload before a trace ever reaches the
+# server. _ensure_weave_initialized() is called both in main() (so LEVI's
+# own proposer/litellm calls, which run in-process and outlive the process,
+# get traced normally) and in score() (so each spawned eval subprocess
+# initializes its own client); score() then calls _weave_client.flush()
+# after the traced call, blocking until that one trace is actually uploaded
+# -- otherwise the parent's near-immediate proc.terminate() races it.
+_weave_initialized_in_process = False
+_weave_client = None
+
+
+def _ensure_weave_initialized() -> None:
+    global _weave_initialized_in_process, _weave_client
+    if not _weave_initialized_in_process:
+        _weave_client = weave.init(WEAVE_PROJECT)
+        _weave_initialized_in_process = True
 
 
 # Substituted by plain string replacement in verge_prompt_bridge.py. Not
@@ -143,7 +166,8 @@ verification, and to do so in fewer retries.
 """
 
 
-def score(prompt: str, _inputs=None) -> dict:
+@weave.op()
+def _traced_score(prompt: str) -> dict:
     """Actually run metalift synthesis with the evolved prompt and see if it verifies."""
     with tempfile.NamedTemporaryFile(
         mode="w", suffix=".txt", delete=False, dir=tempfile.gettempdir()
@@ -179,7 +203,29 @@ def score(prompt: str, _inputs=None) -> dict:
     return json.loads(result_line[len("VERGE_RESULT: ") :])
 
 
+def score(prompt: str, _inputs=None) -> dict:
+    """LEVI's actual entry point -- delegates to the @weave.op()-traced worker.
+
+    weave.init() must run here, BEFORE _traced_score() is invoked, not
+    inside it: @weave.op()'s wrapper checks for an active client at call
+    entry, so a client set up from inside the decorated function itself is
+    one call too late and that call is never traced. Likewise the flush()
+    after the call: this whole subprocess gets killed right after this
+    function returns, so the trace has to be fully uploaded before then.
+    """
+    _ensure_weave_initialized()
+    result = _traced_score(prompt)
+    if _weave_client is not None:
+        _weave_client.flush()
+    return result
+
+
 def main() -> None:
+    # No team prefix -- logs to your own default W&B entity. Initializes
+    # weave in THIS (main) process so LEVI's own proposer/litellm calls,
+    # which run in-process, get traced; each spawned eval subprocess
+    # separately initializes its own client (see _ensure_weave_initialized).
+    _ensure_weave_initialized()
     print(f"Seed: {SEED_MODE} (VERGE_SEED=strong for metalift's production prompt)")
     print(f"Benchmark: {BENCHMARK_NAME}   Model: {MODEL}\n")
     result = levi.evolve_prompts(

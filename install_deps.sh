@@ -388,6 +388,24 @@ if [[ -d "${SCRIPT_DIR}/patches" ]]; then
 fi
 
 # ---------------------------------------------------------------------------
+# 3.6 Weave tracing for the demos (optional, but wired in by both)
+#     Installed straight into levi's uv-managed venv rather than via
+#     `uv add` -- this is a demo-only dependency, not something levi's own
+#     pyproject.toml/uv.lock should carry. `uv run` resolves the venv
+#     against the lockfile on every invocation, but a plain `uv pip install`
+#     survives that (verified) since it doesn't touch the lockfile itself.
+# ---------------------------------------------------------------------------
+if [[ -d "${SCRIPT_DIR}/levi" ]] && command -v uv &>/dev/null; then
+  if (cd "${SCRIPT_DIR}/levi" && uv run python -c "import weave" &>/dev/null); then
+    ok "weave already available in levi's venv."
+  else
+    info "Installing weave into levi's venv (for demo tracing) ..."
+    (cd "${SCRIPT_DIR}/levi" && uv pip install weave) \
+      || warn "Could not install weave; demos will run without tracing."
+  fi
+fi
+
+# ---------------------------------------------------------------------------
 # 4. Python dependencies via Poetry
 # ---------------------------------------------------------------------------
 if [[ "${SKIP_POETRY}" -eq 1 ]]; then

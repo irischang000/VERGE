@@ -152,6 +152,38 @@ uv run python ../demo/prompt_evolution/run.py
 ~5-15 minutes and a few dollars, since every LEVI evaluation runs a full metalift synthesis
 + Rosette verification attempt, not just a proposer call.
 
+**Weave tracing.** `install_deps.sh` installs `weave` into LEVI's `uv` venv automatically
+(section 3.6). Every run initializes weave (your own default W&B entity, no team prefix
+needed) and traces every `score()` call — the candidate prompt in, the score/verified/feedback
+out — plus LEVI's own proposer calls, since weave also autopatches supported LLM clients. The
+run prints a `https://wandb.ai/.../weave/...` link on startup; open it to watch the
+evolutionary loop's self-correction (bad prompt → parser rejection feedback → next candidate)
+as it happens, rather than only reading the final score.
+
+**The non-obvious part, threefold — all three had to be fixed for a trace to actually show
+up in the Weave UI:**
+
+1. LEVI's `ResilientProcessPool` (`levi/levi/utils/resilient_pool.py`) runs every `score_fn`
+   call in a brand-new `multiprocessing.get_context("spawn")` subprocess that's killed right
+   after — a fresh interpreter, so `weave.init()` called once in `main()` never reaches those
+   workers. Both demos guard against this with a small `_ensure_weave_initialized()` helper
+   called both in `main()` (for LEVI's in-process proposer calls) and before every scored
+   evaluation (so each spawned eval subprocess initializes its own client).
+2. `weave.init()` has to run *before* the traced call, never inside it. `@weave.op()`'s
+   wrapper checks for an active client at call entry, so if the decorated function is the one
+   that calls `_ensure_weave_initialized()`, that specific call is already one step too late to
+   be traced ("Traces will not be logged"). Both demos keep `score()` (LEVI's actual entry
+   point) undecorated: it calls `_ensure_weave_initialized()` first, then delegates to a
+   separate `@weave.op()`-decorated `_traced_score()` that does the real work.
+3. Even with (1) and (2) fixed, the op showed up as a *known op name* in the Weave UI but
+   every call was missing — `ResilientProcessPool._execute()` calls `proc.terminate()`
+   (escalating to `proc.kill()`) the instant it reads a result off the queue, and weave's
+   trace upload happens on a background thread *after* the traced function returns. The
+   subprocess was routinely killed before that upload finished. Fix: `score()` captures the
+   client object `weave.init()` returns and calls `_weave_client.flush()` — which blocks
+   until the pending upload actually completes — right after `_traced_score()` returns and
+   before handing the result back to the (about to be killed) subprocess's caller.
+
 **Weak vs. strong seed.** By default the demo starts from a deliberately *weak* prompt —
 it states the task but omits every constraint metalift's parser enforces (single return
 statement, no loops, no intermediate variables, semantic equivalence). That's the README's
@@ -200,6 +232,14 @@ This uses `levi.evolve_code` (not `evolve_prompts`, unlike the sibling demo) —
 function is genuinely code-shaped (choose() calls, IR arithmetic), which is exactly what
 evolve_code is suited for; free-text prompts are not, which is why the other demo had to
 switch away from it.
+
+**Weave tracing.** Same setup and the same `_ensure_weave_initialized()` per-process guard as
+the prompt-evolution demo (see above) — every spawned eval subprocess initializes its own
+weave client before tracing, since `weave.init()` in `main()` alone wouldn't reach them. Since
+LEVI hands `score()` a live function object (not serializable), the traced `@weave.op()` call
+is a separate inner function, `_traced_score(fn_source: str)`, that `score()` delegates to
+after extracting the evolved grammar's source text — so what shows up in the Weave UI is the
+actual candidate grammar code, not an opaque function reference.
 
 **The tricky part:** LEVI's own harness does `exec(code, namespace)` in its own Python 3.11
 process just to *define* the evolved function, even though it never calls it there — so
