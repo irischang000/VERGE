@@ -1,0 +1,107 @@
+diff --git a/metalift/synthesize_rosette.py b/metalift/synthesize_rosette.py
+index 475f9cb9..50f5477b 100644
+--- a/metalift/synthesize_rosette.py
++++ b/metalift/synthesize_rosette.py
+@@ -550,7 +550,11 @@ def synthesize(
+     vc: Expr,
+     loop_and_ps_info: typing.Sequence[Union[CodeInfo, Expr]],
+     cvc_path: str,
+-    uid: int = 1,
++    # Neither frontend (llvm.py, python.py) ever passes this explicitly, so
++    # this default is what every real call actually uses. Defaulting to the
++    # PID rather than a fixed constant is what makes concurrent synthesize()
++    # calls get distinct files instead of racing on shared ones.
++    uid: int = os.getpid(),
+     no_verify: bool = False,
+     unbounded_ints: bool = False,
+     optimize_vc_equality: bool = False,
+@@ -562,15 +566,35 @@ def synthesize(
+     fn_defs_to_exclude: List[FnDeclRecursive] = [],
+ ) -> typing.List[FnDeclRecursive]:
+     synth_dir = "./synthesisLogs/"
+-    if not os.path.exists(synth_dir):
+-        os.mkdir(synth_dir)
+-    # synthFile = synthDir + basename + f"_{uid}" + ".rkt"
+-    synth_file = synth_dir + basename + ".rkt"
+-
+-    with open(synth_dir + "utils.rkt", "w") as out:
+-        out.write(resources.read_text(utils, "utils.rkt"))
+-    with open(synth_dir + "bounded.rkt", "w") as out:
+-        out.write(resources.read_text(utils, "bounded.rkt"))
++    os.makedirs(synth_dir, exist_ok=True)
++    # `basename` alone collides across concurrent synthesize() calls for the
++    # same benchmark (e.g. LEVI evaluating several candidate grammars in
++    # parallel, each in its own subprocess). This was already half-
++    # anticipated (see the uid param this function has always accepted) but
++    # never actually applied to the filenames it was clearly meant for.
++    # Defaulting uid to the PID (below) gives each concurrent process a
++    # distinct one, so this can't just be reverted back to plain `basename`.
++    file_basename = f"{basename}_{uid}"
++    synth_file = synth_dir + file_basename + ".rkt"
++
++    # utils.rkt/bounded.rkt are NOT uid-suffixed -- the generated Racket file
++    # hardcodes `(require "./utils.rkt")` (rosette_translator.py), so the
++    # filename has to stay fixed. Their content never varies between calls,
++    # but a plain `open(..., "w")` truncates before writing, so a concurrent
++    # process racing to `require` this file mid-rewrite can see a corrupted
++    # or empty one -- reproduced directly: two threads each scoring a
++    # different grammar concurrently, and the well-formed one came back
++    # unverified because its Racket process choked on a torn read here.
++    # Write-to-temp-then-atomic-rename (os.replace, atomic on POSIX) means
++    # every reader sees either the complete old file or the complete new
++    # one, never a partial write, while keeping the filename `require`
++    # depends on unchanged.
++    for resource_name in ("utils.rkt", "bounded.rkt"):
++        target_path = synth_dir + resource_name
++        tmp_path = f"{target_path}.{os.getpid()}.tmp"
++        with open(tmp_path, "w") as out:
++            out.write(resources.read_text(utils, resource_name))
++        os.replace(tmp_path, target_path)
+ 
+     if optimize_vc_equality:
+         prev_vc = vc.toSMT()
+@@ -597,7 +621,7 @@ def synthesize(
+     ##### synthesis procedure #####
+     choices: Dict[str, Dict[str, Expr]] = {}
+     to_rosette(
+-        basename=basename,
++        basename=file_basename,
+         filename=synth_file,
+         target_lang=target_lang,
+         vars=vars,
+@@ -619,7 +643,7 @@ def synthesize(
+     last_processed_sol_idx = -1
+ 
+     # before we start synthesis, we need to delete all previous solutions.
+-    for sol_file in Path(synth_dir).glob(f"{basename}_sol*"):
++    for sol_file in Path(synth_dir).glob(f"{file_basename}_sol*"):
+         sol_file.unlink()
+     proc_synthesis = subprocess.Popen(
+         ["racket", synth_file],
+@@ -634,7 +658,7 @@ def synthesize(
+         time.sleep(2)
+ 
+         curr_sol_idx = last_processed_sol_idx + 1
+-        curr_sol_file = Path(f"{synth_dir}/{basename}_sol{curr_sol_idx}")
++        curr_sol_file = Path(f"{synth_dir}/{file_basename}_sol{curr_sol_idx}")
+         curr_sol_exists = curr_sol_file.is_file()
+         if not curr_sol_exists:
+             continue
+@@ -722,7 +746,7 @@ def synthesize(
+             try:
+                 print("TRYING CVC5")
+                 result_verify, verify_logs = verify_synth_result(
+-                    basename,
++                    file_basename,
+                     target_lang,
+                     vars,
+                     preds,
+@@ -740,7 +764,7 @@ def synthesize(
+                 print("TRYING ROSETTE")
+                 print("WARNING: USING LARGE BOUND ROSETTE FOR VERIFICATION")
+                 result_verify, verify_logs = verify_synth_result(
+-                    basename,
++                    file_basename,
+                     target_lang,
+                     vars,
+                     preds,

@@ -355,23 +355,36 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-# 3.5 Apply local patches to the metalift submodule
+# 3.5 Apply local patches to the metalift and levi submodules
 #     (compatibility fixes that haven't landed upstream)
 # ---------------------------------------------------------------------------
-if [[ -d "${REPO_ROOT}" && -d "${SCRIPT_DIR}/patches" ]]; then
+apply_patches_to() {
+  local target_dir="$1"
+  local target_label="$2"
+  local pattern="$3"
+  [[ -d "${target_dir}" ]] || return 0
   shopt -s nullglob
-  for patch_file in "${SCRIPT_DIR}"/patches/*.patch; do
-    if git -C "${REPO_ROOT}" apply --check "${patch_file}" 2>/dev/null; then
-      info "Applying patch $(basename "${patch_file}") to metalift ..."
-      git -C "${REPO_ROOT}" apply "${patch_file}"
+  for patch_file in ${pattern}; do
+    if git -C "${target_dir}" apply --check "${patch_file}" 2>/dev/null; then
+      info "Applying patch $(basename "${patch_file}") to ${target_label} ..."
+      git -C "${target_dir}" apply "${patch_file}"
       ok "Patch $(basename "${patch_file}") applied."
-    elif git -C "${REPO_ROOT}" apply --reverse --check "${patch_file}" 2>/dev/null; then
+    elif git -C "${target_dir}" apply --reverse --check "${patch_file}" 2>/dev/null; then
       ok "Patch $(basename "${patch_file}") already applied."
     else
-      warn "Patch $(basename "${patch_file}") doesn't apply cleanly (metalift may have changed upstream) — skipping."
+      warn "Patch $(basename "${patch_file}") doesn't apply cleanly (${target_label} may have changed upstream) — skipping."
     fi
   done
   shopt -u nullglob
+}
+
+if [[ -d "${SCRIPT_DIR}/patches" ]]; then
+  # Naming convention: metalift-*.patch targets the metalift submodule,
+  # levi-*.patch targets levi. A patch's own diff paths are relative to
+  # its target's repo root regardless of prefix -- the prefix only
+  # decides which submodule `git apply` runs against.
+  apply_patches_to "${REPO_ROOT}" "metalift" "${SCRIPT_DIR}/patches/metalift-*.patch"
+  apply_patches_to "${SCRIPT_DIR}/levi" "levi" "${SCRIPT_DIR}/patches/levi-*.patch"
 fi
 
 # ---------------------------------------------------------------------------

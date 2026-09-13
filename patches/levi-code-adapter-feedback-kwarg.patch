@@ -1,0 +1,30 @@
+diff --git a/levi/artifacts/code.py b/levi/artifacts/code.py
+index bfff599..426adcc 100644
+--- a/levi/artifacts/code.py
++++ b/levi/artifacts/code.py
+@@ -118,12 +118,25 @@ class CodeAdapter(ArtifactAdapter):
+         meta_advice: str | None = None,
+         model: ClientSpec | None = None,
+         use_diff: bool = False,
++        feedback: Sequence[str] | None = None,
+     ) -> str:
++        # `feedback` is accepted (unlike upstream, which only implements it on
++        # PromptAdapter) so that evolve_code's score_fn results carrying
++        # feedback_per_example don't crash producer.py's mutation call --
++        # every mutation attempt raised TypeError before this, an unconditional,
++        # unrecoverable deadlock rather than an occasional failure. Formatted
++        # the same way PromptAdapter._render_feedback_section does.
+         builder = PromptBuilder()
+         builder.add_section("Problem", self.config.problem_description, priority=10)
+         builder.add_section("Signature", f"```python\n{self.config.function_signature}\n```", priority=20)
+         builder.add_parents(list(parents), priority=30)
+ 
++        if feedback:
++            feedback_text = "\n\n".join(
++                f"### Failure {idx}\n{entry}" for idx, entry in enumerate(feedback, start=1)
++            )
++            builder.add_section("Feedback from recent failures", feedback_text, priority=90)
++
+         mutation_overrides = self.config.prompt_overrides.get("mutation", {})
+         model_key = client_name(model) if model is not None else None
+         if model_key and model_key in mutation_overrides:
